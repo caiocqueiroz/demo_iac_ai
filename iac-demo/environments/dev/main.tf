@@ -25,6 +25,14 @@ module "storage" {
   environment          = "dev" # Adding the missing environment parameter
 }
 
+module "second_storage" {
+  source               = "../../modules/storage"
+  resource_group_name  = azurerm_resource_group.dev.name
+  location             = azurerm_resource_group.dev.location
+  storage_account_name = var.second_storage_account_name
+  environment          = "dev"
+}
+
 # module "app" {
 #   source         = "../../modules/app"
 #   resource_group = azurerm_resource_group.dev.name
