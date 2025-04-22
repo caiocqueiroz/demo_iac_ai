@@ -1,0 +1,265 @@
+name: 'Terraform CI/CD'
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'iac-demo/**'
+      - '!.github/workflows/**'  # Exclude workflow file changes
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'iac-demo/**'
+      - '!.github/workflows/**'  # Exclude workflow file changes
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      run_bootstrap:
+        description: 'Run bootstrap job'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # Adicionando um job opcional para criar a infraestrutura do state se necessário
+  terraform-bootstrap:
+    name: 'Terraform Bootstrap'
+    runs-on: ubuntu-latest
+    # Este job é manual/opcional e só deve ser executado quando necessário
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_bootstrap == 'true'
+    
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./iac-demo/bootstrap
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: '1.5.7'
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve
+
+    # Armazenar chave de acesso como secret para uso nos próximos jobs
+    - name: Get Storage Access Key
+      id: get_key
+      run: |
+        echo "::set-output name=storage_key::$(terraform output -raw storage_access_key)"
+    
+    # Você pode adicionar uma etapa para salvar esta chave como um secret no GitHub
+    # Isso requer permissões adicionais ou uso manual da chave
+
+  terraform-dev:
+    name: 'Terraform Dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    # Se o bootstrap for executado, este job deve depender dele
+    needs: [terraform-bootstrap]
+    if: always() && (needs.terraform-bootstrap.result == 'success' || needs.terraform-bootstrap.result == 'skipped')
+    
+    # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./iac-demo/environments/dev
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Install the latest version of Terraform CLI
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: '1.5.7'
+
+    # Login to Azure with service principal
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # Obter a chave da Storage Account para o backend do Terraform
+    - name: Get Storage Access Key
+      id: storage_key
+      run: |
+        STORAGE_KEY=$(az storage account keys list --resource-group terraform-state-rg --account-name tfstatehumbleiaca --query [0].value -o tsv)
+        echo "::add-mask::$STORAGE_KEY"
+        echo "ARM_ACCESS_KEY=$STORAGE_KEY" >> $GITHUB_ENV
+
+    # Initialize a new or existing Terraform working directory
+    - name: Terraform Init
+      run: terraform init
+
+    # Run terraform fmt to check if code is properly formatted
+    - name: Terraform Format
+      run: terraform fmt -check
+
+    # Run terraform validate to validate the code syntax
+    - name: Terraform Validate
+      run: terraform validate
+
+    # Install Python dependencies for OpenAI API
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    # Generate Terraform Plan
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -var-file=terraform.tfvars -out=tfplan
+      continue-on-error: true
+
+    # Analyze Terraform plan with OpenAI
+    - name: Analyze Terraform Plan
+      id: analyze_plan
+      if: github.event_name == 'pull_request'
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        ../../tools/tf_plan_analysis.sh \
+          -w . \
+          -o terraform_analysis.md \
+          -g "$GITHUB_TOKEN" \
+          -p "$PR_NUMBER" \
+          -r "$REPO"
+      continue-on-error: true
+
+    # Add a comment to the PR with the plan output
+    - name: Add Plan Comment
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request'
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const output = `#### Terraform Plan for Dev Environment 📝
+          \`\`\`
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+          `;
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+    # Apply terraform plan for dev on main branch push
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      run: terraform apply -auto-approve tfplan
+
+  terraform-prod:
+    name: 'Terraform Prod'
+    needs: terraform-dev
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: 
+      name: prod
+      url: https://portal.azure.com
+    
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./iac-demo/environments/prod
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Install the latest version of Terraform CLI
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: '1.5.7'
+
+    # Login to Azure with service principal
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # Obter a chave da Storage Account para o backend do Terraform
+    - name: Get Storage Access Key
+      id: storage_key
+      run: |
+        STORAGE_KEY=$(az storage account keys list --resource-group terraform-state-rg --account-name tfstatehumbleiaca --query [0].value -o tsv)
+        echo "::add-mask::$STORAGE_KEY"
+        echo "ARM_ACCESS_KEY=$STORAGE_KEY" >> $GITHUB_ENV
+
+    # Initialize a new or existing Terraform working directory
+    - name: Terraform Init
+      run: terraform init
+
+    # Install Python dependencies for OpenAI API
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    # Generate Terraform Plan
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -var-file=terraform.tfvars -out=tfplan
+
+    # Analyze Terraform plan with OpenAI (for reference, not posted to PR)
+    - name: Analyze Terraform Plan
+      id: analyze_plan
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        ../tools/tf_plan_analysis.sh -w . -o terraform_analysis.md
+      continue-on-error: true
+
+    # Upload analysis as artifact
+    - name: Upload analysis
+      uses: actions/upload-artifact@v3
+      if: steps.analyze_plan.outcome == 'success'
+      with:
+        name: prod-terraform-analysis
+        path: ./iac-demo/environments/prod/terraform_analysis.md
+        retention-days: 14
+
+    # Apply terraform changes
+    - name: Terraform Apply
+      run: terraform apply -auto-approve tfplan
